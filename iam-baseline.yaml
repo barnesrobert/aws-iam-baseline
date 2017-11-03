@@ -1,0 +1,278 @@
+#===============================================================================
+# Template: iam-baseline.yaml
+#
+# Purpose:  Creates the IAM roles and policies for the designated account.
+#
+# Preconditon: The SAML metadata XML file must exist in the S3 bucket that is
+#              specified as a parameter in this template.
+#===============================================================================
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates the IAM roles and policies for the designated account
+
+#==================================================
+# Metadata
+#==================================================
+Metadata:
+
+  AWS::CloudFormation::Interface:
+
+    ParameterGroups:
+      - Label:
+          default: IAM Settings
+        Parameters:
+          - SamlProviderName
+          - SamlMetadataBucket
+          - SamlMetadataFilename
+
+    ParameterLabels:
+      SamlProviderName:
+        default: SAML Provider Name
+      SamlMetadataBucket:
+        default: SAML Metadata Bucket
+      SamlMetadataFilename:
+        default: SAML Metadata Filename
+
+#==================================================
+# Parameters
+#==================================================
+Parameters:
+
+  SamlProviderName:
+    Description: |
+      Name of SAML provider to be created
+    Type: String
+    Default: "idp"
+    AllowedPattern: "^[a-zA-Z0-9\\.\\_\\-]{1,128}$"
+
+  SamlMetadataBucket:
+    Description: |
+      Name of existing S3 bucket where the SAML metadata file resides
+    Type: String
+
+  SamlMetadataFilename:
+    Description: |
+      Name of existing XML SAML metadata filename in the S3 bucket above
+    Type: String
+    Default: SAML.xml
+
+#==================================================
+# Resources
+#==================================================
+Resources:
+
+  #==================================================
+  # The following service role, Lambda function, and custom resource are used
+  # to create a SAML provider; CloudFormation does not currently support the
+  # creation of SAML providers intrinsically.
+  #==================================================
+  CreateSamlIdentityProviderServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SAMLPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                - !Sub arn:aws:s3:::${SamlMetadataBucket}/${SamlMetadataFilename}
+              - Effect: Allow
+                Action:
+                  - iam:CreateSAMLProvider
+                  - iam:DeleteSAMLProvider
+                  - iam:ListSAMLProviders
+                Resource:
+                - "*"
+
+  # This custom Lambda resource will create a SAML identity provider.
+  CreateSamlIdentityProvider:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - CreateSamlIdentityProviderServiceRole
+    Properties:
+      Environment:
+        Variables:
+          saml_bucket_name: !Ref SamlMetadataBucket
+          saml_filename: !Ref SamlMetadataFilename
+          saml_provider_name: !Ref SamlProviderName
+          saml_provider_arn: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${SamlProviderName}
+      Code:
+        ZipFile: !Sub |
+          #==================================================================================================
+          # Function: CreateSamlIdentityProvider
+          # Purpose:  Creates the SAML identity provider
+          #==================================================================================================
+
+          import json
+          import boto3
+          import os
+          import botocore
+          import cfnresponse
+
+          #==================================================
+          # Default handler
+          #==================================================
+          def lambda_handler(event, context):
+
+              print(json.dumps(event))
+
+              response_status = cfnresponse.SUCCESS
+              response_data = ''
+
+              saml_provider_exists = False # prove otherwise
+
+              # First, determine whether the SAML provider already exists.
+              for saml_provider in boto3.client('iam').list_saml_providers()['SAMLProviderList']:
+                saml_provider_exists = saml_provider_exists or os.environ['saml_provider_arn'] == saml_provider['Arn']
+
+              print('SAML provider {} exists: {}'.format(os.environ['saml_provider_arn'], saml_provider_exists))
+
+              # Only execute in a custom CloudFormation resource creation or update event.
+              if not saml_provider_exists and ('RequestType' in event and event['RequestType'] in ['Create', 'Update']):
+
+                try:
+
+                  # Specify the local filename.
+                  local_filename = '/tmp/' + os.environ['saml_filename']
+
+                  # Download the file from S3 to a local file.
+                  boto3.resource('s3').Bucket(os.environ['saml_bucket_name']).download_file(
+                      os.environ['saml_filename'],
+                      local_filename
+                      )
+
+                  # Get the contents of the file.
+                  file = open(local_filename, 'r')
+                  file_contents = file.read()
+                  file.close()
+
+                  # Create the SAML provider and provide the metatdata document.
+                  response = boto3.resource('iam').create_saml_provider(
+                      SAMLMetadataDocument = file_contents,
+                      Name = os.environ['saml_provider_name']
+                  )
+
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == '404':
+                        print('The file {} does not exist in the bucket {}.'.format(os.environ['saml_filename'], os.environ['saml_bucket_name']))
+                    else:
+                        raise
+
+              elif saml_provider_exists and ('RequestType' in event and event['RequestType'] == 'Delete'):
+                  # Delete the SAML provider.
+                  response = boto3.client('iam').delete_saml_provider(
+                      SAMLProviderArn = os.environ['saml_provider_arn']
+                  )
+
+              # Send the response to CloudFormation.
+              cfnresponse.send(event, context, response_status, {"Response":response_data}, '')
+
+      Description: Creates the SAML identity provider
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt CreateSamlIdentityProviderServiceRole.Arn
+      Runtime: python3.6
+      Timeout: 5
+
+  CreateSamlIdentityProviderResource:
+    Type: Custom::CreateSamlIdentityProvider
+    DependsOn: CreateSamlIdentityProvider
+    Properties:
+      ServiceToken: !GetAtt CreateSamlIdentityProvider.Arn
+      # Updating this value will force the re-execution of the Lambda function:
+      saml_provider_name: !Ref SamlProviderName
+      saml_provider_arn: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${SamlProviderName}
+
+#==================================================
+# Create the account roles
+#==================================================
+
+  # Administrator is a highly privileged role.
+  AdmininstratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SAML-Administrator
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: sts:AssumeRoleWithSAML
+          Effect: Allow
+          Condition:
+            StringEquals:
+              SAML:aud: https://signin.aws.amazon.com/saml
+          Principal:
+            Federated: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${SamlProviderName}
+
+  # A power user is similar to an administrator but does not
+  # have IAM or Organizations permissions.
+  PowerUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SAML-PowerUser
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: sts:AssumeRoleWithSAML
+          Effect: Allow
+          Condition:
+            StringEquals:
+              SAML:aud: https://signin.aws.amazon.com/saml
+          Principal:
+            Federated: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${SamlProviderName}
+
+  # Read-only role can view (and only view) any resource.
+  ReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SAML-Readonly
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: sts:AssumeRoleWithSAML
+          Effect: Allow
+          Condition:
+            StringEquals:
+              SAML:aud: https://signin.aws.amazon.com/saml
+          Principal:
+            Federated: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${SamlProviderName}
+
+  # The CloudFormation delegated service role is a highly privileged role needed to launch CloudFormation stacks.
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudFormationFullAccessServiceRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
